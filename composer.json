@@ -1,5 +1,5 @@
 {
-    "name": "jgrisafe/idoc",
+    "name": "ovac/idoc",
     "license": "MIT",
     "description": "Generate beautiful API documentation from your Laravel application",
     "keywords": [
