@@ -150,7 +150,7 @@ class IDocGenerator
                 }
 
                 $type = $this->normalizeParameterType($type);
-                list($description, $example) = $this->parseDescription($description, $type);
+                list($description, $example) = $this->parseDescription($tag->getDescription(), $type);
                 $value = is_null($example) ? $this->generateDummyValue($type) : $example;
 
                 return [$name => compact('type', 'description', 'required', 'value')];
@@ -316,7 +316,14 @@ class IDocGenerator
     private function parseDescription(string $description, string $type)
     {
         $example = null;
-        if (preg_match('/(.*)\s+Example:\s*(.*)\s*/', $description, $content)) {
+
+        $regex = $type === 'object'
+            ? '/(.*)\s+Example:\s*({(.*)[\w\W]*})/m'
+            : ($type === 'array'
+                ? '/(.*)\s+Example:\s*(\[(.*)[\w\W]*\])/m'
+                : '/(.*)\s+Example:\s*(.*)\s*/');
+
+        if (preg_match($regex, $description, $content)) {
             $description = $content[1];
 
             // examples are parsed as strings by default, we need to cast them properly
@@ -347,6 +354,10 @@ class IDocGenerator
         //because PHP considers string 'false' as true.
         if ($value == 'false' && $type == 'boolean') {
             return false;
+        }
+
+        if (in_array($type, ['json', 'object', 'array'])) {
+            return $value;
         }
 
         if (isset($casts[$type])) {
