@@ -2,15 +2,19 @@
 
 namespace OVAC\IDoc;
 
-use Faker\Factory;
+use Illuminate\Http\Request;
 use Illuminate\Routing\Route;
+
+use Faker\Factory;
+use Illuminate\Support\Arr;
 use Mpociot\Reflection\DocBlock;
 use Mpociot\Reflection\DocBlock\Tag;
-use OVAC\IDoc\Tools\ResponseResolver;
 use OVAC\IDoc\Tools\Traits\ParamHelpers;
+use OVAC\IDoc\Util\ArrayUtil;
 use ReflectionClass;
 use ReflectionMethod;
 use Symfony\Component\Yaml\Yaml;
+
 
 class IDocGenerator
 {
@@ -36,6 +40,13 @@ class IDocGenerator
         return array_diff($route->methods(), ['HEAD']);
     }
 
+    public function getClassPath(string $fileName, string $type)
+    {
+        $matches = [];
+        preg_match_all('/use\s(.*);/', file_get_contents($fileName), $matches);
+        return Arr::first($matches[1], fn($path) => str_ends_with($path, $type));
+    }
+
     /**
      * @param \Illuminate\Routing\Route $route
      * @param array $apply Rules to apply when generating documentation for this route
@@ -51,28 +62,135 @@ class IDocGenerator
 
         $routeGroup = $this->getRouteGroup($controller, $method);
         $docBlock = $this->parseDocBlock($method);
-        $bodyParameters = $this->getBodyParametersFromDocBlock($docBlock['tags']);
-        $queryParameters = $this->getQueryParametersFromDocBlock($docBlock['tags']);
-        $pathParameters = $this->getPathParametersFromDocBlock($docBlock['tags']);
-        $content = ResponseResolver::getResponse($route, $docBlock['tags'], [
-            'rules' => $rulesToApply,
-            'body' => $bodyParameters,
-            'query' => $queryParameters,
-        ]);
+        $tags = $docBlock->getTags();
+
+        if (empty($tags)) return null;
+
+        $methodArguments = $method->getParameters();
+
+        $parameters = collect($route->parameterNames())
+            ->mapWithKeys(function(string $name) use ($method, $methodArguments, $docBlock, $controller)
+            {
+                /* @var \ReflectionParameter $parameter */
+                $parameter = collect($methodArguments)->first(fn(\ReflectionParameter $a) => $a->name === $name);
+
+                if (!$parameter) {
+                    throw new \Exception("parameter $name does not match method signature for {$method->getName()}");
+                }
+
+                $type = $this->normalizeParameterType($parameter->getType()->getName());
+
+                return [$name => [
+                    'in' => 'path',
+                    'type' => $type,
+                    'description' => '',
+                    'required' => true,
+                    'value' => $this->generateDummyValue($type)
+                ]];
+            })
+            ->toArray();
+
+        $bodyParameters = collect($method->getParameters())
+            ->map(function(\ReflectionParameter $parameter)
+            {
+                try {
+                    $class = new ReflectionClass($parameter->getType()->getName());
+
+                    if ($class->isSubclassOf(Request::class)) {
+                        return collect($class->getProperties())
+                            ->filter(fn($property) => $property->getDeclaringClass()->getName() === $class->getName())
+                            ->mapWithKeys(function(\ReflectionProperty $property)
+                            {
+                                $type = $property->getType();
+
+                                if (method_exists($type, 'getName')) {
+                                    $typeName = $type->getName();
+                                } elseif (method_exists($type, 'getTypes')) {
+                                    $types = $type->getTypes();
+                                    $typeName = array_shift($types);
+                                    // Todo: support multiple union types (currently uses first one)
+                                    // $typeName = array_reduce($types, fn($name, $t) => "$name|$t", $first);
+                                }
+
+                                return [$property->getName() => [
+                                    'in' => 'body',
+                                    'type' => $typeName,
+                                    'description' => '',
+                                    'required' => true,
+                                    'value' => $this->generateDummyValue($type)
+                                ]];
+                            });
+                    }
+                } catch (\Exception) {
+                    return false;
+                }
+
+                return false;
+            })
+            ->filter(fn($value) => !!$value)
+            ->first();
+
+        $responses = collect($tags)->filter(fn($tag) => $tag->getName() === 'return')->values()
+            ->mapWithKeys(function(Tag $tag) use ($controller)
+            {
+                $type = trim($tag->getType(), '\/\\');
+                $isList = !empty($matches[1]) || isset($matches[3]);
+                preg_match('/(array|Collection)?<?([\w]*)>?(\[\])?/', $type, $matches);
+                $classPath = $this->getClassPath($controller->getFileName(), $type);
+                $class = new ReflectionClass($classPath);
+
+                $properties = collect($class->getProperties())
+                    ->filter(fn($property) => $property->getDeclaringClass()->getName() === $class->getName())
+                    ->mapWithKeys(function(\ReflectionProperty $property)
+                    {
+                        $type = $property->getType();
+
+                        if (method_exists($type, 'getName')) {
+                            $typeName = $type->getName();
+                        } elseif (method_exists($type, 'getTypes')) {
+                            $types = $type->getTypes();
+                            $typeName = array_shift($types);
+                            // Todo: support multiple union types (currently uses first one)
+                            // $typeName = array_reduce($types, fn($name, $t) => "$name|$t", $first);
+                        }
+
+                        return [$property->getName() => [
+                            'type' => $this->normalizeParameterType($typeName),
+                            'example' => $this->generateDummyValue($type)
+                        ]];
+                    });
+
+                $responseSchema = [
+                    'type' => 'string',
+                    'required' => ['id'],
+                    'properties' => $properties
+                ];
+
+                return [200 => [
+                    'status' => '200',
+                    'description' => $isList ? "Array of $matches[2]s" : $matches[2],
+                    'content' => [
+                        'application/json' => [
+                            'schema' => $isList
+                                ? ['type' => 'array', 'items' => ['$ref' => "#/components/schemas/$matches[2]"]]
+                                : $responseSchema
+                        ]
+                    ]
+                ]];
+            });
 
         $parsedRoute = [
             'id' => md5($this->getUri($route) . ':' . implode($this->getMethods($route))),
             'group' => $routeGroup,
-            'title' => $docBlock['short'],
-            'description' => $docBlock['long'],
+            'title' => $method->getName(),
+            'description' => $docBlock->getLongDescription()->getContents() ?? $docBlock->getShortDescription(),
             'methods' => $this->getMethods($route),
             'uri' => $this->getUri($route),
+            'parameters' => $parameters,
             'bodyParameters' => $bodyParameters,
-            'queryParameters' => $queryParameters,
-            'pathParameters' => $pathParameters,
-            'authenticated' => $authenticated = $this->getAuthStatusFromDocBlock($docBlock['tags']),
-            'response' => $content,
-            'showresponse' => !empty($content),
+            'authenticated' => $authenticated = $this->getAuthStatusFromDocBlock($tags),
+            'responses' => $responses,
+            'showresponse' => !empty($responses),
         ];
 
         if (!$authenticated && array_key_exists('Authorization', ($rulesToApply['headers'] ?? []))) {
@@ -89,52 +207,17 @@ class IDocGenerator
      *
      * @return array
      */
-    protected function getPathParametersFromDocBlock(array $tags)
-    {
-        $parameters = collect($tags)
-            ->filter(function($tag) {
-                return $tag->getName() === 'pathParam';
-            })
-            ->mapWithKeys(function($tag) {
-                preg_match('/(.+?)\s+(.+?)\s+(required\s+)?(.*)/', $tag->getContent(), $content);
-                if (empty($content)) {
-                    // this means only name and type were supplied
-                    list($name, $type) = preg_split('/\s+/', $tag->getContent());
-                    $required = false;
-                    $description = '';
-                } else {
-                    list($_, $name, $type, $required, $description) = $content;
-                    $description = trim($description);
-                    if ($description == 'required' && empty(trim($required))) {
-                        $required = $description;
-                        $description = '';
-                    }
-                    $required = trim($required) == 'required' ? true : false;
-                }
-
-                $type = $this->normalizeParameterType($type);
-                list($description, $example, $properties) = $this->parseDescription($description, $type);
-                $value = is_null($example) ? $this->generateDummyValue($type) : $example;
-
-                return [$name => compact('type', 'description', 'required', 'value', 'properties')];
-            })->toArray();
-
-        return $parameters;
-    }
-
-    /**
-     * @param array $tags
-     *
-     * @return array
-     */
     protected function getBodyParametersFromDocBlock(array $tags)
     {
         $parameters = collect($tags)
-            ->filter(function($tag) {
+            ->filter(function($tag)
+            {
                 return $tag instanceof Tag && $tag->getName() === 'bodyParam';
             })
-            ->mapWithKeys(function($tag) {
+            ->mapWithKeys(function($tag)
+            {
                 preg_match('/(.+?)\s+(.+?)\s+(required\s+)?(.*)/', $tag->getContent(), $content);
+
                 if (empty($content)) {
                     // this means only name and type were supplied
                     list($name, $type) = preg_split('/\s+/', $tag->getContent());
@@ -151,10 +234,18 @@ class IDocGenerator
                 }
 
                 $type = $this->normalizeParameterType($type);
-                list($description, $example, $properties) = $this->parseDescription($tag->getDescription(), $type);
-                $value = is_null($example) ? $this->generateDummyValue($type) : $example;
 
-                return [$name => compact('type', 'description', 'required', 'value', 'properties')];
+                list($description, $example, $properties) = $this->parseDescription($tag->getDescription(), $type);
+
+                $ref = $properties['$ref'] ?? null;
+
+                $value = is_null($example)
+                    ? $this->generateDummyValue($type, $ref ? ['$ref' => $ref] : null)
+                    : $example;
+
+                return in_array($name, ['allOf'])
+                    ? $properties
+                    : [$name => compact('type', 'description', 'required', 'value', 'properties')];
             })->toArray();
 
         return $parameters;
@@ -168,12 +259,43 @@ class IDocGenerator
     protected function getAuthStatusFromDocBlock(array $tags)
     {
         $authTag = collect($tags)
-            ->first(function($tag) {
+            ->first(function($tag)
+            {
                 return $tag instanceof Tag && strtolower($tag->getName()) === 'authenticated';
             });
 
         return (bool)$authTag;
     }
+
+    /**
+     * @param array $tags
+     *
+     * @return array
+     */
+    protected function getResponseParametersFromDocBlock(array $tags)
+    {
+        $reponses = collect($tags)
+            ->filter(function($tag)
+            {
+                return $tag instanceof Tag && $tag->getName() === 'response';
+            })
+            ->mapWithKeys(function($tag)
+            {
+                preg_match('/([\d]{3})?([\h\S]*)?\n?([\w\W]*)?/m', $tag->getContent(), $content);
+
+                list($_, $status, $description, $content) = $content;
+                $description = trim($description);
+
+                if (!empty($content)) {
+                    $content = $this->parseProperties($content);
+                }
+
+                return [$status => compact('status', 'description', 'content')];
+            })->toArray();
+
+        return $this->generateResponses($reponses);
+    }
+
 
     /**
      * @param ReflectionClass $controller
@@ -215,10 +337,12 @@ class IDocGenerator
     protected function getQueryParametersFromDocBlock(array $tags)
     {
         $parameters = collect($tags)
-            ->filter(function($tag) {
+            ->filter(function($tag)
+            {
                 return $tag instanceof Tag && $tag->getName() === 'queryParam';
             })
-            ->mapWithKeys(function($tag) {
+            ->mapWithKeys(function($tag)
+            {
                 preg_match('/(.+?)\s+(.+?)\s+(required\s+)?(.*)/', $tag->getContent(), $content);
                 if (empty($content)) {
                     // this means only name and type were supplied
@@ -247,62 +371,107 @@ class IDocGenerator
 
     /**
      * @param ReflectionMethod $method
-     *
-     * @return array
+     * @return DocBlock
      */
     protected function parseDocBlock(ReflectionMethod $method)
     {
         $comment = $method->getDocComment();
-        $phpdoc = new DocBlock($comment);
-
-        return [
-            'short' => $phpdoc->getShortDescription(),
-            'long' => $phpdoc->getLongDescription()->getContents(),
-            'tags' => $phpdoc->getTags(),
-        ];
+        $docBlock = new DocBlock($comment);
+        return $docBlock;
     }
 
     private function normalizeParameterType($type)
     {
         $typeMap = [
-            'int' => 'integer',
+            'int' => 'number',
             'bool' => 'boolean',
             'double' => 'float',
+            'ref' => 'schema',
         ];
 
-        return $type ? ($typeMap[$type] ?? $type) : 'string';
+        try {
+            return $type ? ($typeMap[$type] ?? $type) : 'string';
+        } catch (\Throwable) {
+            return 'string';
+        }
     }
 
-    private function generateDummyValue(string $type)
+    private function generateDummyValue(?string $type, array $schema = null)
     {
         $faker = Factory::create();
         $fakes = [
-            'integer' => function() {
+            'integer' => function()
+            {
                 return rand(1, 20);
             },
-            'number' => function() use ($faker) {
+            'number' => function() use ($faker)
+            {
                 return $faker->randomFloat();
             },
-            'float' => function() use ($faker) {
+            'float' => function() use ($faker)
+            {
                 return $faker->randomFloat();
             },
-            'boolean' => function() use ($faker) {
+            'boolean' => function() use ($faker)
+            {
                 return $faker->boolean();
             },
-            'string' => function() use ($faker) {
+            'string' => function() use ($faker)
+            {
                 return $faker->asciify('************');
             },
-            'array' => function() {
-                return '[]';
+            'array' => fn() => $schema ?? '[]',
+            'object' => fn() => $schema ?? '{}',
+            'date' => function() use ($faker)
+            {
+                return $faker->dateTimeThisMonth()->format(\DateTime::ISO8601);
             },
-            'object' => function() {
-                return '{}';
+            'schema' => function() use ($schema)
+            {
+                return $schema[0] ?? null;
             },
         ];
 
         $fake = $fakes[$type] ?? $fakes['string'];
 
         return $fake();
+    }
+
+    private function recursivelyGenerateDummyValues($properties, &$result = [], $path = '')
+    {
+        if (is_array($properties)) {
+            if (isset($properties['items']['properties'])) {
+                foreach ($properties['items']['properties'] as $propertyKey => $propertyValue) {
+                    $this->recursivelyGenerateDummyValues(
+                        $propertyValue,
+                        $result,
+                        "$path.0.$propertyKey"
+                    );
+                }
+            } elseif (isset($properties['properties'])) {
+                ArrayUtil::set($result, $path, $this->recursivelyGenerateDummyValues(
+                    $properties['properties'],
+                    $result,
+                    $path
+                ));
+            } elseif (isset($properties['type'])) {
+                $example = isset($properties['example'])
+                    ? $properties['example']
+                    : $this->generateDummyValue($properties['type']);
+
+                ArrayUtil::set($result, $path, $example);
+            } else {
+                foreach ($properties as $key => $property) {
+                    $this->recursivelyGenerateDummyValues(
+                        $property,
+                        $result,
+                        "$path.$key"
+                    );
+                }
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -322,12 +491,13 @@ class IDocGenerator
         return [$description, $example, $properties];
     }
 
-    private function parseProperties(string $description)
+    private function parseProperties(string|array $description)
     {
         if (preg_match('/\s*(properties:\s*(.*)[\w\W]*)/m', $description, $content)) {
-            return $this->parsePropertiesYaml($content[1]);
+            $yaml = $this->parseYaml(array_pop($content), 'properties');
+            return $yaml;
         } else {
-            return null;
+            return $description;
         }
     }
 
@@ -360,11 +530,11 @@ class IDocGenerator
         }
     }
 
-    private function parsePropertiesYaml(string $yaml)
+    private function parseYaml(string $yaml, string $key)
     {
         try {
             $yaml = Yaml::parse($yaml);
-            return $yaml['properties'];
+            return $yaml[$key] ?? $yaml;
         } catch (\Exception $e) {
             print_r("Error parsing properties yaml: {$e->getMessage()}");
             return null;
@@ -403,5 +573,44 @@ class IDocGenerator
         }
 
         return $value;
+    }
+
+    /**
+     * Generate the openAPI response object for a route
+     *
+     * @param array $responseContent
+     */
+    private function generateResponses(array $responses)
+    {
+        return array_reduce($responses, function($result, $response)
+        {
+            $status = (int)(isset($response['status']) ? $response['status'] : 200);
+            $description = isset($response['description']) ? $response['description'] : 'success';
+            $contentBody = isset($response['content']) ? $response['content'] : [];
+
+            switch ($status) {
+                case 204:
+                    $content = [];
+                    break;
+                default:
+                    $example = $this->recursivelyGenerateDummyValues($contentBody);
+                    $content = [
+                        'application/json' => [
+                            'schema' => [
+                                'type' => 'object',
+                                'properties' => $contentBody,
+                                'example' => $example
+                            ]
+                        ]
+                    ];
+            }
+
+            $result[$status] = [
+                'description' => $description,
+                'content' => $content
+            ];
+
+            return $result;
+        }, []);
     }
 }
